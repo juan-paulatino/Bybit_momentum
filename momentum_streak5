@@ -1,0 +1,115 @@
+use bybit::spot::ws::{PublicResponse, PublicWebSocketApiClient};
+use bybit_demo::rest_connector::{post_order, OrderType, Side};
+use std::collections::VecDeque;
+use tokio::task;
+
+pub static API_KEY: &str = "";
+pub static API_SECRET: &str = "";
+
+#[derive(Debug, PartialEq)]
+enum Direction {
+    UP,
+    DOWN,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), reqwest::Error> {
+    let mut client = PublicWebSocketApiClient::new();
+
+    client.subscribe_trade("BTCUSDT", false);
+
+    // Use a Arc<Mutex<VecDeque>> to safely share the state between threads.
+    // The main thread receives WebSocket data, and the spawned task
+    // reads and modifies this state.
+    let dir_history_vec = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::<Direction>::with_capacity(5)));
+    let previous_price = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+
+    // Clone the Arcs for use in the callback closure.
+    let history_clone = dir_history_vec.clone();
+    let price_clone = previous_price.clone();
+
+    let callback = move |res: PublicResponse| {
+        if let PublicResponse::Trade(res) = res {
+            let trade = &res.data[0];
+            let last_price: f64 = match trade.p.parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("Failed to parse price: {}", trade.p);
+                    return;
+                }
+            };
+            let last_quant: f64 = match trade.q.parse() {
+                Ok(q) => q,
+                Err(_) => {
+                    eprintln!("Failed to parse quantity: {}", trade.q);
+                    return;
+                }
+            };
+
+            println!("Price: {}", last_price);
+            println!("Quantity: {}", last_quant);
+
+            let mut history = history_clone.lock().unwrap();
+            let mut prev_price = price_clone.lock().unwrap();
+
+            if last_price > *prev_price {
+                history.push_back(Direction::UP);
+            } else if last_price < *prev_price {
+                history.push_back(Direction::DOWN);
+            }
+            // If price is the same, we don't push a direction. The queue size will not change.
+
+            *prev_price = last_price;
+            
+            if history.len() > 5 {
+                history.pop_front();
+            }
+
+            // Check if we have 5 consistent directions
+            if history.len() == 5 {
+                let first_dir = history.get(0).unwrap();
+                let is_consistent = history.iter().all(|dir| dir == first_dir);
+
+                if is_consistent {
+                    // Post Order logic is now offloaded to a non-blocking task.
+                    let order_side = match first_dir {
+                        Direction::UP => Side::Buy,
+                        Direction::DOWN => Side::Sell,
+                    };
+                    let order_price = match first_dir {
+                        Direction::UP => last_price + 1.,
+                        Direction::DOWN => last_price - 1.,
+                    };
+                    
+                    // Clear the history to avoid placing multiple orders
+                    // for the same trend.
+                    history.clear();
+
+                    println!("Trend detected! Placing order...");
+
+                    // Spawn a new task to handle the blocking post_order call.
+                    task::spawn(async move {
+                        if let Err(e) = post_order(
+                            "BTCUSDT",
+                            OrderType::Limit,
+                            last_quant,
+                            Some(order_price),
+                            order_side,
+                        ).await {
+                            eprintln!("Failed to post order: {}", e);
+                        } else {
+                            println!("Order placed successfully!");
+                        }
+                    });
+                }
+            }
+        }
+    };
+
+    match client.run(callback) {
+        Ok(_) => {}
+        Err(e) => eprintln!("WebSocket client error: {}", e),
+    }
+
+    Ok(())
+}
